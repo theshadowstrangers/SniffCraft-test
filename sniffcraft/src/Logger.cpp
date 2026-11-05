@@ -215,10 +215,25 @@ std::string ToLowerCase(const std::string& s);
 
 bool PacketNameMatch(const std::string_view& packet_name, const std::string& search_str_lowcase);
 
+static bool ParseEditedTextToBytes(const std::string& text, std::vector<unsigned char>& out)
+{
+    out.clear();
+    std::istringstream ss(text);
+    std::string tok;
+    while (ss >> tok)
+    {
+        if (tok.rfind("0x", 0) == 0 || tok.rfind("0X", 0) == 0) tok = tok.substr(2);
+        try { out.push_back(static_cast<unsigned char>(std::stoul(tok, nullptr, 16))); }
+        catch (...) { return false; }
+    }
+    return !out.empty();
+}
+
 std::tuple<std::shared_ptr<Packet>, ConnectionState, Endpoint> Logger::Render()
 {
     ImGuiStyle& style = ImGui::GetStyle();
-    std::tuple<std::shared_ptr<Packet>, ConnectionState, Endpoint> return_value = { nullptr, ConnectionState::None, Endpoint::Client };
+    std::tuple<RenderAction, std::shared_ptr<Packet>, ConnectionState, Endpoint> return_value =
+    { RenderAction::None, nullptr, ConnectionState::None, Endpoint::Client };
     ImGui::PushID(base_filename.c_str());
     const ImVec2 available_space = ImGui::GetContentRegionAvail();
     const float min_table_content_width =
@@ -281,6 +296,9 @@ std::tuple<std::shared_ptr<Packet>, ConnectionState, Endpoint> Logger::Render()
                             // (otherwise some offset in the json could match a
                             // different dumped byte)
                             selected_bytes.clear();
+                            selected_packet = item.packet;
+                            selected_state  = item.connection_state;
+                            selected_origin = SimpleOrigin(item.origin);
                             item.packet->Write(selected_bytes);
                             size_t remaining_bytes = selected_bytes.size();
                             ReadIterator iter = selected_bytes.cbegin();
@@ -299,9 +317,7 @@ std::tuple<std::shared_ptr<Packet>, ConnectionState, Endpoint> Logger::Render()
                     ImGui::SameLine();
                     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));;
                     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));;
-                    if (ImGui::Button("X", ImVec2(0.0f, ImGui::GetTextLineHeightWithSpacing())))
-                    {
-                        return_value = { item.packet, item.connection_state, SimpleOrigin(item.origin) };
+                    return_value = { RenderAction::Ignore, item.packet, item.connection_state, SimpleOrigin(item.origin) };
                         if (selected_index == packets_history_filtered_indices[i])
                         {
                             selected_index = -1;
@@ -366,17 +382,67 @@ std::tuple<std::shared_ptr<Packet>, ConnectionState, Endpoint> Logger::Render()
     std::pair<bool, std::pair<size_t, size_t>> hovered_bytes = { false, { 0, 0 } };
     ImGui::SameLine();
     ImGui::BeginChild("##json_display", ImVec2(0.45f * (available_space.x - 2.0 * ImGui::GetStyle().ItemSpacing.x - table_width), 0.55f * (available_space.y - ImGui::GetStyle().ItemSpacing.y)), ImGuiChildFlags_FrameStyle, ImGuiWindowFlags_HorizontalScrollbar);
-    if (selected_index != -1)
+if (selected_index != -1)
+{
+    hovered_bytes = RenderJson(selected_json, selected_bytes.size(), 0, 0);
+
+    // --- строка кнопок справа сверху ---
+    ImGui::SetCursorPosX(ImGui::GetWindowWidth() - ImGui::CalcTextSize("Copy").x - ImGui::GetStyle().FramePadding.x * 3 - ImGui::GetStyle().ScrollbarSize + ImGui::GetScrollX());
+    ImGui::SetCursorPosY(ImGui::GetStyle().FramePadding.y + ImGui::GetScrollY());
+
+    if (!edit_mode)
     {
-        hovered_bytes = RenderJson(selected_json, selected_bytes.size(), 0, 0);
-        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - ImGui::CalcTextSize("Copy").x - ImGui::GetStyle().FramePadding.x * 3 - ImGui::GetStyle().ScrollbarSize + ImGui::GetScrollX());
-        ImGui::SetCursorPosY(ImGui::GetStyle().FramePadding.y + ImGui::GetScrollY());
         if (ImGui::Button("Copy"))
-        {
             ImGui::SetClipboardText(RemoveParsingDetails(selected_json).Dump(4).c_str());
+        if (ImGui::Button("Change"))
+{
+    edit_mode = true;
+    std::stringstream hs;
+    for (size_t i = 0; i < selected_bytes.size(); ++i)
+        hs << "0x" << std::setw(2) << std::setfill('0') << std::uppercase << std::hex
+           << static_cast<int>(selected_bytes[i]) << (i + 1 == selected_bytes.size() ? "" : " ");
+    edited_text = hs.str();
+}
+        
+        ImGui::SameLine();
+        if (ImGui::Button("Execute"))
+        {
+            // просто отправить выбранный пакет как есть
+            return_value = { RenderAction::Send, selected_packet, selected_state, selected_origin };
         }
     }
-    ImGui::EndChild();
+    else
+    {
+        if (ImGui::Button("Cancel"))
+            edit_mode = false;
+        ImGui::SameLine();
+        if (ImGui::Button("Enabled"))
+        {
+            // 1) сериализуем отредактированный текст в байты
+            std::vector<unsigned char> new_bytes;
+            // ВАЖНО: здесь нужно распарсить edited_text обратно в байты.
+            // Если редактируем JSON — нужен парсер JSON->Packet (см. ниже).
+            // Если hex — просто разобрать "0xAA 0xBB ...".
+            if (ParseEditedTextToBytes(edited_text, new_bytes))
+            {
+                std::shared_ptr<Packet> new_pkt = selected_packet->CopyTypeOnly();
+                ReadIterator it = new_bytes.cbegin();
+                size_t rem = new_bytes.size();
+                new_pkt->Read(it, rem);
+
+                return_value = { RenderAction::Send, new_pkt, selected_state, selected_origin };
+                edit_mode = false;
+            }
+        }
+
+        // поле ввода
+        ImGui::SetCursorPosY(ImGui::GetStyle().FramePadding.y * 2 + ImGui::GetFrameHeight() + ImGui::GetScrollY());
+        ImGui::InputTextMultiline("##edit_field", &edited_text,
+            ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetContentRegionAvail().y - 4),
+            ImGuiInputTextFlags_AllowTabInput);
+    }
+}
+ImGui::EndChild();
 
     ImGui::SameLine();
     ImGui::BeginChild("##bytes_display", ImVec2(table_width, 0.55f * (available_space.y - ImGui::GetStyle().ItemSpacing.y)), ImGuiChildFlags_FrameStyle, ImGuiWindowFlags_HorizontalScrollbar);
