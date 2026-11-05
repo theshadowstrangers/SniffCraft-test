@@ -34,9 +34,15 @@ public:
     void LoadConfig();
     void Stop();
 #ifdef WITH_GUI
+    enum class RenderAction { None, Ignore, Send };
+
     /// @brief Render this Logger packets
-    /// @return A tuple <message, connection state, origin> to add to ignored, if first element is nullptr, nothing to add
-    std::tuple<std::shared_ptr<ProtocolCraft::Packet>, ProtocolCraft::ConnectionState, Endpoint> Render();
+    /// @return A tuple <action, message, connection state, origin>.
+    ///         If action == None, nothing to do.
+    ///         If action == Ignore, add the message to the ignored list.
+    ///         If action == Send, send the message through the proxy.
+    std::tuple<RenderAction, std::shared_ptr<ProtocolCraft::Packet>, ProtocolCraft::ConnectionState, Endpoint> Render();
+
     /// @brief Will recreate packets_history_filtered_indices based on currently ignored packets and search string
     void UpdateFilteredPackets();
 #endif
@@ -94,6 +100,9 @@ private:
     std::mutex packets_history_mutex;
     long long int selected_index = -1;
     std::vector<unsigned char> selected_bytes;
+    // Edit mode state
+    bool edit_mode = false;
+    std::string edited_text;
     ProtocolCraft::Json::Value selected_json;
     bool count_per_s_clientbound = false;
     bool count_per_s_serverbound = false;
